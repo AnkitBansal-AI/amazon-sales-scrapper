@@ -1,23 +1,13 @@
 """
-Amazon Estimated-Monthly-Sales microservice.
+Amazon Product Sales + Keyword Search microservice.
 
-Given a keyword, fetches Amazon search-results page(s) (no product-page
-visits at all) and returns the estimated total monthly sales value for
-that keyword: sum of (units "bought in past month" x price) across the
-unique products found.
-
-This is a trimmed-down combination of the user's original search_phase.py
-+ scraper_common.py, keeping ONLY what's needed to answer that one
-question. Removed entirely:
-  - CSV job files / SQLite database / any persistence (the caller's own
-    backend is expected to store keyword/timestamp/result - see notes at
-    bottom of this file)
-  - seller_asin tracking / position-finding
-  - top-product deep scrape (product detail page visit + all its parsing:
-    breadcrumb, brand, BSR, returns policy, manufacturer, etc.)
-  - research summary CSV export
-  - the hardcoded os.chdir("C:/Users/Srikant/...") from both original
-    files, which would crash outside that one machine
+Given a keyword, in ONE browser session:
+  1. PRODUCT SALES: fetches Amazon search-results page(s) and returns the
+     estimated total monthly sales value, plus the top 5 products by
+     sales value (title, price per unit, total sales value, image).
+  2. KEYWORD SEARCH: reuses the SAME already-open page (no second page
+     load) to type the keyword into Amazon's nav search box and read
+     back the autocomplete suggestions.
 
 Run locally (needs Chrome installed; webdriver-manager fetches a matching
 chromedriver automatically):
@@ -36,9 +26,11 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
@@ -55,19 +47,13 @@ AMAZON_DOMAIN = os.environ.get("AMAZON_DOMAIN", "amazon.in")
 # Adaptive page-count logic: Amazon's page 1 itself can return anywhere
 # from ~16 to ~48 organic tiles depending on the category, so rather than
 # always fetching a fixed number of pages, decide how many to fetch based
-# on how many products page 1 actually returned:
-#   - page 1 has PAGE1_HIGH_THRESHOLD+ products  -> stop, 1 page is enough
-#   - page 1 has fewer than PAGE1_LOW_THRESHOLD  -> fetch 2 more (3 total)
-#   - otherwise (in between)                     -> fetch 1 more (2 total)
+# on how many products page 1 actually returned.
 PAGE1_HIGH_THRESHOLD = 40
 PAGE1_LOW_THRESHOLD = 20
 PAGE_FETCH_DELAY_SECONDS = 2
 
-# Amazon's search-results template hydrates extra product tiles in as you
-# scroll, so grabbing page_source immediately after driver.get() only
-# captures whatever rendered in the first second or two. Scroll to the
-# bottom repeatedly, pausing to let new tiles hydrate, and stop once the
-# tile count holds steady (or we hit the hard round cap).
+TOP_PRODUCTS_COUNT = 5
+
 SEARCH_RESULT_SELECTOR = '[data-component-type="s-search-result"]'
 SCROLL_STABLE_ROUNDS_REQUIRED = 2
 SCROLL_MAX_ROUNDS = 15
@@ -75,6 +61,10 @@ SCROLL_PAUSE_SECONDS = 1.2
 
 REVIEWS_PATTERN = re.compile(r"^[\d,]+\s+ratings?$", re.IGNORECASE)
 BOUGHT_PATTERN = re.compile(r"([\d,.]+)\s*([KMkm]?)\+?\s*bought", re.IGNORECASE)
+
+AUTOCOMPLETE_TIMEOUT = 10
+TYPING_WAIT_SECONDS = 1.0
+SUGGESTION_COUNT = 10
 
 
 # ---------------------------------------------------------------------------
@@ -85,13 +75,6 @@ def build_driver():
     """
     Create a headless Chrome driver configured to look like a normal
     browser (Amazon actively checks for signs of automation).
-
-    In Docker, set CHROME_BIN and CHROMEDRIVER_PATH env vars to point at
-    apt-installed chromium/chromedriver (see Dockerfile) so this skips
-    webdriver-manager's online version-matching lookup, which is both
-    faster and more reliable in a container. Locally (no env vars set),
-    it falls back to webdriver-manager, which auto-downloads a matching
-    driver for whatever Chrome you have installed.
     """
     options = Options()
     options.add_argument("--headless=new")
@@ -130,9 +113,6 @@ def fetch_search_page(driver, keyword: str, page: int = 1) -> str:
     url = f"https://www.{AMAZON_DOMAIN}/s?k={query}&page={page}"
     driver.get(url)
 
-    # On a blocked/captcha page or a zero-result page this just times out
-    # and falls through - is_blocked_page() / the "no products" handling
-    # below takes it from there.
     try:
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, SEARCH_RESULT_SELECTOR))
@@ -173,19 +153,14 @@ def is_blocked_page(html: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Parse (trimmed to just what's needed for the sales estimate)
+# Parse search-results page: asin, title, price, image, bought_value
 # ---------------------------------------------------------------------------
-
-def _clean_number_string(value):
-    return value.replace(",", "") if value else value
-
 
 def parse_products(html: str) -> list[dict]:
     """
-    Parse a rendered Amazon search-results page into a list of
-    {"asin": ..., "bought_value": ...} dicts - the minimum needed to
-    compute the estimated monthly sales value. No detail-page fields,
-    no badges/images/delivery text/etc.
+    Parse a rendered Amazon search-results page into a list of product
+    dicts with just what we need: asin, title, price, image_url, and
+    bought_value (estimated total sales value for that product).
     """
     try:
         soup = BeautifulSoup(html, "lxml")
@@ -202,6 +177,9 @@ def parse_products(html: str) -> list[dict]:
             continue  # not a real product tile (e.g. a widget/ad slot)
 
         asin = card.get("data-asin") or None
+
+        img_el = card.find("img", class_="s-image")
+        image_url = img_el.get("src") if img_el else None
 
         price_whole = card.find("span", {"class": "a-price-whole"})
         price_fraction = card.find("span", {"class": "a-price-fraction"})
@@ -228,13 +206,75 @@ def parse_products(html: str) -> list[dict]:
             except (ValueError, TypeError):
                 bought_value = None
 
-        products.append({"asin": asin, "bought_value": bought_value})
+        products.append({
+            "asin": asin,
+            "title": title,
+            "price": price,
+            "image_url": image_url,
+            "bought_value": bought_value,
+        })
 
     return products
 
 
 # ---------------------------------------------------------------------------
-# Core scrape logic
+# Autocomplete: reuse the already-open page's nav search box
+# ---------------------------------------------------------------------------
+
+def get_autocomplete_suggestions(driver, keyword: str) -> list[str]:
+    """
+    Type the keyword into the nav search box on whatever page is
+    currently loaded (no separate navigation to the homepage) and read
+    back the autocomplete dropdown suggestions.
+    """
+    driver.execute_script("window.scrollTo(0, 0);")
+    time.sleep(0.3)
+
+    try:
+        search_box = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.ID, "twotabsearchtextbox"))
+        )
+    except TimeoutException:
+        logger.warning("Could not find Amazon search box for autocomplete on keyword=%r", keyword)
+        return []
+
+    search_box.click()
+    search_box.send_keys(Keys.CONTROL, "a")
+    search_box.send_keys(Keys.BACKSPACE)
+    search_box.send_keys(keyword)
+
+    time.sleep(TYPING_WAIT_SECONDS)
+
+    def _extract() -> list[str]:
+        selectors = [
+            (By.CSS_SELECTOR, "div.s-suggestion"),
+            (By.CSS_SELECTOR, "div[role='option']"),
+            (By.CSS_SELECTOR, "[data-type='suggestion']"),
+        ]
+        for by, selector in selectors:
+            candidates = driver.find_elements(by, selector)
+            visible = [el for el in candidates if el.is_displayed()]
+            if visible:
+                seen = set()
+                suggestions = []
+                for el in visible:
+                    text = " ".join(el.text.split()).strip()
+                    if text and text.casefold() not in seen:
+                        seen.add(text.casefold())
+                        suggestions.append(text)
+                return suggestions
+        return []
+
+    try:
+        WebDriverWait(driver, AUTOCOMPLETE_TIMEOUT).until(lambda d: len(_extract()) > 0)
+    except TimeoutException:
+        pass
+
+    return _extract()[:SUGGESTION_COUNT]
+
+
+# ---------------------------------------------------------------------------
+# Core combined logic
 # ---------------------------------------------------------------------------
 
 class ScraperBlockedError(Exception):
@@ -242,16 +282,6 @@ class ScraperBlockedError(Exception):
 
 
 def _target_page_count(first_page_product_count: int) -> int:
-    """
-    Amazon's search-results page inconsistently renders anywhere from
-    ~16 to ~48 product tiles on page 1 depending on the keyword, so a
-    fixed page count either wastes time re-fetching an already-dense page
-    or undercounts a sparse one. Decide how many pages are worth fetching
-    based on what page 1 actually returned:
-      - 40+ products on page 1  -> that's already a full page, stop at 1
-      - 20-39 products          -> fetch one more page (2 total)
-      - <20 products            -> sparse page, fetch two more (3 total)
-    """
     if first_page_product_count >= PAGE1_HIGH_THRESHOLD:
         return 1
     elif first_page_product_count >= PAGE1_LOW_THRESHOLD:
@@ -260,65 +290,91 @@ def _target_page_count(first_page_product_count: int) -> int:
         return 3
 
 
-def get_estimated_monthly_sales(keyword: str) -> dict:
-    driver = build_driver()
-    start = time.time()
+def run_product_search(driver, keyword: str) -> dict:
     products_by_asin: dict[str, dict] = {}
-    unkeyed_bought_values: list[float] = []  # rare: card has no asin at all
     pages_fetched = 0
 
-    def _collect(page_products: list[dict]) -> None:
+    html = fetch_search_page(driver, keyword, page=1)
+
+    if is_blocked_page(html):
+        raise ScraperBlockedError(
+            f"Amazon blocked the request for keyword '{keyword}' (page 1)."
+        )
+
+    page_products = parse_products(html)
+    pages_fetched = 1
+    for p in page_products:
+        asin = p.get("asin")
+        if asin:
+            products_by_asin.setdefault(asin, p)
+
+    target_pages = _target_page_count(len(page_products))
+    logger.info(
+        "Keyword=%r: page 1 returned %d products -> targeting %d page(s) total",
+        keyword, len(page_products), target_pages,
+    )
+
+    for page_num in range(2, target_pages + 1):
+        time.sleep(PAGE_FETCH_DELAY_SECONDS)
+        html = fetch_search_page(driver, keyword, page=page_num)
+
+        if is_blocked_page(html):
+            break
+
+        page_products = parse_products(html)
+        if not page_products:
+            break
+
         for p in page_products:
             asin = p.get("asin")
             if asin:
                 products_by_asin.setdefault(asin, p)
-            elif p.get("bought_value") is not None:
-                unkeyed_bought_values.append(p["bought_value"])
+
+        pages_fetched += 1
+
+    products = list(products_by_asin.values())
+    estimated_monthly_sales_value = sum(
+        p["bought_value"] for p in products if p.get("bought_value") is not None
+    )
+
+    ranked = sorted(
+        [p for p in products if p.get("bought_value") is not None],
+        key=lambda p: p["bought_value"],
+        reverse=True,
+    )
+    top_products = [
+        {
+            "title": p["title"],
+            "price": p["price"],
+            "total_sales_value": round(p["bought_value"], 2),
+            "image_url": p["image_url"],
+        }
+        for p in ranked[:TOP_PRODUCTS_COUNT]
+    ]
+
+    return {
+        "estimated_monthly_sales_value": round(estimated_monthly_sales_value, 2),
+        "num_products_found": len(products),
+        "pages_fetched": pages_fetched,
+        "top_products": top_products,
+    }
+
+
+def run_combined_search(keyword: str) -> dict:
+    driver = build_driver()
+    start = time.time()
 
     try:
-        # Page 1 is always fetched first; it also tells us how many more
-        # pages (if any) are worth fetching for this particular keyword.
-        html = fetch_search_page(driver, keyword, page=1)
-
-        if is_blocked_page(html):
-            raise ScraperBlockedError(
-                f"Amazon blocked the request for keyword '{keyword}' (page 1)."
-            )
-
-        page_products = parse_products(html)
-        pages_fetched = 1
-        _collect(page_products)
-
-        target_pages = _target_page_count(len(page_products))
-        logger.info(
-            "Keyword=%r: page 1 returned %d products -> targeting %d page(s) total",
-            keyword, len(page_products), target_pages,
-        )
-
-        for page_num in range(2, target_pages + 1):
-            time.sleep(PAGE_FETCH_DELAY_SECONDS)
-            html = fetch_search_page(driver, keyword, page=page_num)
-
-            if is_blocked_page(html):
-                break  # keep whatever was already collected from earlier pages
-
-            page_products = parse_products(html)
-            if not page_products:
-                break  # ran out of results before hitting the target
-
-            _collect(page_products)
-            pages_fetched += 1
-
-        products = list(products_by_asin.values())
-        estimated_monthly_sales_value = sum(
-            p["bought_value"] for p in products if p.get("bought_value") is not None
-        ) + sum(unkeyed_bought_values)
+        product_result = run_product_search(driver, keyword)
+        suggested_keywords = get_autocomplete_suggestions(driver, keyword)
 
         return {
             "keyword": keyword,
-            "estimated_monthly_sales_value": round(estimated_monthly_sales_value, 2),
-            "num_products_found": len(products) + len(unkeyed_bought_values),
-            "pages_fetched": pages_fetched,
+            "estimated_monthly_sales_value": product_result["estimated_monthly_sales_value"],
+            "num_products_found": product_result["num_products_found"],
+            "top_products": product_result["top_products"],
+            "suggested_keywords": suggested_keywords,
+            "pages_fetched": product_result["pages_fetched"],
             "elapsed_seconds": round(time.time() - start, 1),
         }
     finally:
@@ -332,17 +388,26 @@ def get_estimated_monthly_sales(keyword: str) -> dict:
 # FastAPI app
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Amazon Sales Estimator Microservice")
+app = FastAPI(title="Amazon Product Sales + Keyword Search Microservice")
 
 
 class ScrapeRequest(BaseModel):
     keyword: str = Field(..., min_length=1, max_length=200)
 
 
+class TopProduct(BaseModel):
+    title: str
+    price: str | None = None
+    total_sales_value: float
+    image_url: str | None = None
+
+
 class ScrapeResponse(BaseModel):
     keyword: str
     estimated_monthly_sales_value: float
     num_products_found: int
+    top_products: list[TopProduct]
+    suggested_keywords: list[str]
     pages_fetched: int
     elapsed_seconds: float
 
@@ -360,17 +425,16 @@ def scrape(req: ScrapeRequest):
 
     logger.info("Scraping keyword=%r", keyword)
     try:
-        result = get_estimated_monthly_sales(keyword)
+        result = run_combined_search(keyword)
     except ScraperBlockedError as e:
         logger.warning("Blocked: %s", e)
-        # 503 so the caller (your backend) knows to retry later / back off,
-        # rather than treating this as a permanent failure.
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.exception("Scrape failed for keyword=%r", keyword)
         raise HTTPException(status_code=500, detail=f"Scrape failed: {e}")
 
-    logger.info("Done keyword=%r -> %s", keyword, result)
+    logger.info("Done keyword=%r -> %d products, %d suggestions, %.1fs",
+                keyword, result["num_products_found"], len(result["suggested_keywords"]), result["elapsed_seconds"])
     return result
 
 
@@ -378,9 +442,5 @@ def scrape(req: ScrapeRequest):
 # Notes
 # ---------------------------------------------------------------------------
 # This service is stateless by design - it does NOT store keyword/timestamp/
-# result anywhere. That's intentionally left to your main backend API (the
-# "job" layer from the architecture we discussed): it should call POST
-# /scrape, then persist {keyword, timestamp, result} in its own database.
-# Keeping this service stateless makes it trivial to scale horizontally
-# (run N copies behind a load balancer) without any shared state to worry
-# about here.
+# result anywhere. That's left to the backend API, which calls POST /scrape
+# and persists {keyword, timestamp, result} in its own database.
