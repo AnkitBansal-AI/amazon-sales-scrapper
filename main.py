@@ -348,6 +348,7 @@ def run_product_search(driver, keyword: str) -> dict:
             "price": p["price"],
             "total_sales_value": round(p["bought_value"], 2),
             "image_url": p["image_url"],
+            "product_url": f"https://www.{AMAZON_DOMAIN}/dp/{p['asin']}" if p.get("asin") else None,
         }
         for p in ranked[:TOP_PRODUCTS_COUNT]
     ]
@@ -400,6 +401,7 @@ class TopProduct(BaseModel):
     price: str | None = None
     total_sales_value: float
     image_url: str | None = None
+    product_url: str | None = None
 
 
 class ScrapeResponse(BaseModel):
